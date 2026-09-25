@@ -1,109 +1,30 @@
 #!/usr/bin/env python3
-"""Vehicle safety recall publication, transfer, remedy and completion tracker."""
+"""车辆安全召回与修复跟踪：HTTP 入口与召回/维修流程。
+
+业务拆分：
+- store.py   持久化（SQLite 表结构与原子读写）
+- permits.py 许可判定（签发、占用、核销/释放）
+- app.py     入口（HTTP 路由、召回与维修流程编排）
+"""
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sqlite3
 import sys
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-DB_PATH = Path(__file__).with_name("data.db")
-
-
-def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def j(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message); self.status, self.message = status, message
-
-
-class Store:
-    def __init__(self, path: str | Path = DB_PATH):
-        self.path = str(path)
-        self.conn = sqlite3.connect(self.path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.init_schema()
-
-    def init_schema(self) -> None:
-        self.conn.executescript("""
-        CREATE TABLE IF NOT EXISTS dealers (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
-          country TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS vehicles (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, vin TEXT UNIQUE NOT NULL, model TEXT NOT NULL,
-          model_year INTEGER NOT NULL, country TEXT NOT NULL, origin_country TEXT NOT NULL, owner_name TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS recalls (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, manufacturer TEXT NOT NULL, campaign_code TEXT UNIQUE NOT NULL,
-          title TEXT NOT NULL, scope_json TEXT NOT NULL, remedy_version INTEGER NOT NULL,
-          remedy_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('draft','submitted','published','returned')),
-          scope_version INTEGER NOT NULL DEFAULT 1, revision INTEGER NOT NULL DEFAULT 1,
-          review_note TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS scope_changes (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, recall_id INTEGER NOT NULL REFERENCES recalls(id),
-          scope_version INTEGER NOT NULL, scope_json TEXT NOT NULL, created_by TEXT NOT NULL,
-          created_at TEXT NOT NULL, UNIQUE(recall_id,scope_version)
-        );
-        CREATE TABLE IF NOT EXISTS parts (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, recall_id INTEGER NOT NULL REFERENCES recalls(id),
-          dealer_id INTEGER NOT NULL REFERENCES dealers(id), remedy_version INTEGER NOT NULL,
-          available INTEGER NOT NULL CHECK(available>=0), UNIQUE(recall_id,dealer_id,remedy_version)
-        );
-        CREATE TABLE IF NOT EXISTS repairs (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, recall_id INTEGER NOT NULL REFERENCES recalls(id),
-          vehicle_id INTEGER NOT NULL REFERENCES vehicles(id), dealer_id INTEGER NOT NULL REFERENCES dealers(id),
-          remedy_version INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('reported','confirmed','flagged')),
-          evidence_hash TEXT NOT NULL, evidence_consistent INTEGER NOT NULL, cross_border INTEGER NOT NULL DEFAULT 0,
-          border_permit TEXT, idempotency_key TEXT NOT NULL, reported_by TEXT NOT NULL,
-          reported_at TEXT NOT NULL, reviewed_by TEXT, reviewed_at TEXT, review_note TEXT,
-          UNIQUE(recall_id,vehicle_id,idempotency_key)
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS one_confirmed_repair ON repairs(recall_id,vehicle_id) WHERE status='confirmed';
-        CREATE TABLE IF NOT EXISTS notifications (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, recall_id INTEGER NOT NULL REFERENCES recalls(id),
-          vehicle_id INTEGER NOT NULL REFERENCES vehicles(id), scope_version INTEGER NOT NULL,
-          channel TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
-          UNIQUE(recall_id,vehicle_id,scope_version)
-        );
-        CREATE TABLE IF NOT EXISTS regulatory_reports (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, recall_id INTEGER NOT NULL REFERENCES recalls(id),
-          scope_version INTEGER NOT NULL, payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
-          created_at TEXT NOT NULL, UNIQUE(recall_id,scope_version)
-        );
-        CREATE TABLE IF NOT EXISTS audit_log (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
-          entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
-        );
-        """)
-        self.conn.commit()
-
-    def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
-        self.conn.execute("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?,?)",
-                          (now(), actor, action, entity_type, str(entity_id), j(details)))
-
-    def close(self) -> None:
-        self.conn.close()
+from permits import ApiError, PermitService
+from store import DB_PATH, Store, j, now
 
 
 class RecallService:
     def __init__(self, store: Store):
         self.store, self.conn = store, store.conn
+        self.permits = PermitService(store)
 
     @staticmethod
     def _actor(actor: str | None, role: str | None, allowed: set[str]) -> str:
@@ -210,6 +131,22 @@ class RecallService:
         self._create_release_artifacts(recall_id, scope_version, actor)
         return self._recall_dict(self._row("recalls", recall_id))
 
+    def update_remedy(self, actor: str | None, role: str | None, recall_id: int, remedy: dict, expected_version: int) -> dict:
+        """修复方案换版：旧版许可将无法占用新版本维修。"""
+        actor = self._actor(actor, role, {"manufacturer"})
+        if not remedy.get("description") or not remedy.get("version"): raise ApiError(400, "修复方案描述和版本不能为空")
+        new_version = int(remedy["version"])
+        recall = self._row("recalls", recall_id)
+        if recall["manufacturer"] != actor: raise ApiError(403, "只能修改本机构的召回方案")
+        if recall["state"] != "published": raise ApiError(409, "只有已发布召回可以换版")
+        if int(expected_version) != int(recall["revision"]): raise ApiError(409, "召回已被修改，请刷新版本")
+        if new_version <= int(recall["remedy_version"]): raise ApiError(409, "新版本号必须大于当前版本")
+        with self.conn:
+            self.conn.execute("UPDATE recalls SET remedy_version=?,remedy_json=?,revision=revision+1,updated_at=? WHERE id=? AND revision=?",
+                              (new_version, j(remedy), now(), recall_id, expected_version))
+            self.store.audit(actor, "recall.remedy_change", "recall", recall_id, {"remedy_version": new_version})
+        return self._recall_dict(self._row("recalls", recall_id))
+
     def add_parts(self, actor: str | None, role: str | None, recall_id: int, dealer_id: int, remedy_version: int, quantity: int) -> dict:
         actor = self._actor(actor, role, {"manufacturer", "regulator"})
         if quantity <= 0: raise ApiError(400, "入库数量必须大于零")
@@ -239,17 +176,26 @@ class RecallService:
         scope = json.loads(recall["scope_json"])
         if not self._in_scope(vehicle, scope): raise ApiError(409, "车辆不在当前召回范围内")
         cross_border = dealer["country"] != vehicle["country"]
-        if cross_border and not border_permit.strip(): raise ApiError(403, "跨境维修需要有效许可")
+        permit_code = border_permit.strip()
+        if cross_border and not permit_code: raise ApiError(403, "跨境维修需要有效许可凭证编号")
         part = self.conn.execute("SELECT * FROM parts WHERE recall_id=? AND dealer_id=? AND remedy_version=?", (recall_id, dealer_id, remedy_version)).fetchone()
         if not part or int(part["available"]) < 1: raise ApiError(409, "维修网点零件库存不足")
         with self.conn:
             cur = self.conn.execute("""INSERT INTO repairs(recall_id,vehicle_id,dealer_id,remedy_version,status,evidence_hash,evidence_consistent,
                                      cross_border,border_permit,idempotency_key,reported_by,reported_at)
                                      VALUES(?,?,?,?, 'reported',?,?,?,?,?,?,?)""",
-                                    (recall_id, vehicle["id"], dealer_id, remedy_version, evidence_hash, int(evidence_consistent), int(cross_border), border_permit, idempotency_key, actor, now()))
+                                    (recall_id, vehicle["id"], dealer_id, remedy_version, evidence_hash, int(evidence_consistent), int(cross_border), permit_code, idempotency_key, actor, now()))
             self.conn.execute("UPDATE parts SET available=available-1 WHERE id=? AND available>0", (part["id"],))
-            self.store.audit(actor, "repair.report", "repair", cur.lastrowid, {"recall_id": recall_id, "vin": vehicle["vin"], "cross_border": cross_border})
-        return dict(self._row("repairs", cur.lastrowid))
+            occupation = None
+            if cross_border:
+                # 同一许可并发占用只放行一笔：原子加占 + (许可,请求键) 唯一约束
+                occupation = self.permits.hold_for_repair(permit_code, actor, recall_id, vehicle, dealer, remedy_version, f"repair:{idempotency_key}")
+                self.permits.link_repair(occupation["id"], cur.lastrowid)
+            self.store.audit(actor, "repair.report", "repair", cur.lastrowid, {"recall_id": recall_id, "vin": vehicle["vin"], "cross_border": cross_border,
+                                                                               "occupation_id": occupation["id"] if occupation else None})
+        result = dict(self._row("repairs", cur.lastrowid))
+        if occupation: result["permit_occupation"] = occupation
+        return result
 
     def review_repair(self, actor: str | None, role: str | None, repair_id: int, decision: str, note: str = "") -> dict:
         actor = self._actor(actor, role, {"regulator"})
@@ -262,7 +208,25 @@ class RecallService:
             if new_status == "flagged":
                 self.conn.execute("UPDATE parts SET available=available+1 WHERE recall_id=? AND dealer_id=? AND remedy_version=?",
                                   (repair["recall_id"], repair["dealer_id"], repair["remedy_version"]))
+                self.permits.settle_for_repair(repair_id, write_off=False, reason="复核退回", actor=actor)
+            else:
+                # 复核通过：占用核销，额度不退回，使用记录保留
+                self.permits.settle_for_repair(repair_id, write_off=True, reason=note or "复核核销", actor=actor)
             self.store.audit(actor, "repair.review", "repair", repair_id, {"decision": decision, "status": new_status, "note": note})
+        return dict(self._row("repairs", repair_id))
+
+    def withdraw_repair(self, actor: str | None, role: str | None, repair_id: int, note: str = "") -> dict:
+        """网点撤回未复核维修：退回零件并释放许可占用（流水保留）。"""
+        actor = self._actor(actor, role, {"dealer", "regulator"})
+        repair = self._row("repairs", repair_id)
+        if repair["status"] != "reported": raise ApiError(409, "只有待复核维修可以撤回")
+        with self.conn:
+            self.conn.execute("UPDATE repairs SET status='withdrawn',reviewed_by=?,reviewed_at=?,review_note=? WHERE id=?",
+                              (actor, now(), note or "网点撤回", repair_id))
+            self.conn.execute("UPDATE parts SET available=available+1 WHERE recall_id=? AND dealer_id=? AND remedy_version=?",
+                              (repair["recall_id"], repair["dealer_id"], repair["remedy_version"]))
+            self.permits.settle_for_repair(repair_id, write_off=False, reason="维修撤回", actor=actor)
+            self.store.audit(actor, "repair.withdraw", "repair", repair_id, {"note": note})
         return dict(self._row("repairs", repair_id))
 
     def _create_release_artifacts(self, recall_id: int, scope_version: int, actor: str) -> None:
@@ -311,20 +275,28 @@ class RecallService:
         result = self._recall_dict(self._row("recalls", recall_id))
         result["repairs"] = [dict(row) for row in self.conn.execute("SELECT * FROM repairs WHERE recall_id=? ORDER BY id", (recall_id,))]
         result["reports"] = [dict(row) for row in self.conn.execute("SELECT * FROM regulatory_reports WHERE recall_id=? ORDER BY scope_version", (recall_id,))]
+        result["permits"] = [self.permits.permit_dict(row) for row in self.store.list_permits(recall_id)]
         return result
 
     def state(self) -> dict:
         return {"dealers": [dict(row) for row in self.conn.execute("SELECT * FROM dealers ORDER BY id")],
                 "vehicles": [dict(row) for row in self.conn.execute("SELECT * FROM vehicles ORDER BY id")],
                 "recalls": [self._recall_dict(row) for row in self.conn.execute("SELECT * FROM recalls ORDER BY id DESC")],
+                "permits": [self.permits.permit_dict(row) for row in self.conn.execute("SELECT * FROM permits ORDER BY id")],
+                "occupations": [PermitService.occupation_dict(row) for row in self.conn.execute("SELECT * FROM permit_occupations ORDER BY id")],
                 "audits": [dict(row) for row in self.conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 30")]}
 
     def seed(self) -> None:
         if not self.conn.execute("SELECT id FROM dealers LIMIT 1").fetchone():
             self.register_dealer("regulator-demo", "regulator", "D-CN", "演示中心", "CN")
+            self.register_dealer("regulator-demo", "regulator", "D-SG", "新加坡演示中心", "SG")
         if not self.conn.execute("SELECT id FROM recalls LIMIT 1").fetchone():
-            recall = self.create_recall("maker-demo", "manufacturer", "RC-2026-001", "制动管路检查", {"models": ["X1"], "model_years": [2018, 2019], "vin_prefixes": ["LX"], "countries": ["CN"]}, {"version": 1, "description": "更换制动管"})
-            self.submit_recall("maker-demo", "manufacturer", recall["id"], recall["revision"])
+            recall = self.create_recall("maker-demo", "manufacturer", "RC-2026-001", "制动管路检查", {"models": ["X1"], "model_years": [2018, 2019], "vin_prefixes": ["LX"], "countries": ["CN", "SG"]}, {"version": 1, "description": "更换制动管"})
+            recall = self.submit_recall("maker-demo", "manufacturer", recall["id"], recall["revision"])
+            self.review_recall("regulator-demo", "regulator", recall["id"], "publish", recall["revision"], "同意发布")
+            dealer_sg = self.conn.execute("SELECT id FROM dealers WHERE code='D-SG'").fetchone()["id"]
+            self.permits.issue("regulator-demo", "regulator", "P-DEMO-001", recall["id"], "X1", "SG", 5, valid_days=180, note="演示跨境额度")
+            self.add_parts("maker-demo", "manufacturer", recall["id"], dealer_sg, 1, 5)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -336,6 +308,11 @@ class Handler(BaseHTTPRequestHandler):
         data = json.dumps(body, ensure_ascii=False).encode(); self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
 
+    def _send_error(self, exc: ApiError) -> None:
+        payload = {"error": exc.message}
+        if exc.details: payload.update(exc.details)
+        self._send(exc.status, payload)
+
     def _body(self) -> dict:
         size = int(self.headers.get("Content-Length", "0"))
         try: return json.loads(self.rfile.read(size)) if size else {}
@@ -343,11 +320,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _parts(self) -> list[str]: return [p for p in urlparse(self.path).path.strip("/").split("/") if p]
 
+    def _query(self) -> dict: return {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+
     def do_GET(self) -> None:
         try:
             p = self._parts()
             if p in (["health"], ["api", "health"]): out = {"status": "ok"}
             elif p == ["api", "state"]: out = self.service.state()
+            elif p == ["api", "permits"]:
+                out = self.service.permits.list(self.headers.get("X-Actor"), self.headers.get("X-Role"), self._query().get("recall_id"))
+            elif len(p) == 3 and p[:2] == ["api", "permits"] and p[2] != "balance":
+                out = self.service.permits.detail(self.headers.get("X-Actor"), self.headers.get("X-Role"), p[2])
+            elif len(p) == 4 and p[:2] == ["api", "permits"] and p[3] == "balance":
+                out = self.service.permits.balance(self.headers.get("X-Actor"), self.headers.get("X-Role"), p[2])
             elif len(p) == 3 and p[:2] == ["api", "recalls"]: out = self.service.recall_detail(int(p[2]))
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "unfinished":
                 out = self.service.unfinished(self.headers.get("X-Actor"), self.headers.get("X-Role"), int(p[2]))
@@ -355,7 +340,7 @@ class Handler(BaseHTTPRequestHandler):
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
-        except ApiError as exc: self._send(exc.status, {"error": exc.message})
+        except ApiError as exc: self._send_error(exc)
         except Exception as exc: self._send(500, {"error": str(exc)})
 
     def do_POST(self) -> None:
@@ -368,12 +353,18 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "submit": out = self.service.submit_recall(actor, role, int(p[2]), int(body.get("expected_version", -1)))
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "review": out = self.service.review_recall(actor, role, int(p[2]), body.get("decision", ""), int(body.get("expected_version", -1)), body.get("note", ""))
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "scope": out = self.service.change_scope(actor, role, int(p[2]), body.get("scope", {}), int(body.get("expected_version", -1)))
+            elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "remedy": out = self.service.update_remedy(actor, role, int(p[2]), body.get("remedy", {}), int(body.get("expected_version", -1)))
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "parts": out = self.service.add_parts(actor, role, int(p[2]), int(body.get("dealer_id", 0)), int(body.get("remedy_version", 0)), int(body.get("quantity", 0)))
+            elif p == ["api", "permits"]: out = self.service.permits.issue(actor, role, body.get("code", ""), int(body.get("recall_id", 0)), body.get("model", ""), body.get("country", ""), int(body.get("quota", 0)), body.get("remedy_version"), body.get("expires_at", ""), body.get("valid_days"), body.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "permits"] and p[3] == "occupy": out = self.service.permits.occupy(actor, role, p[2], int(body.get("recall_id", 0)), body.get("vin", ""), int(body.get("dealer_id", 0)), body.get("request_key", ""), int(body.get("amount", 1)))
+            elif len(p) == 4 and p[:2] == ["api", "permits"] and p[3] == "revoke": out = self.service.permits.revoke(actor, role, p[2], body.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "occupations"] and p[3] == "release": out = self.service.permits.release(actor, role, int(p[2]), body.get("reason", "manual"))
             elif p == ["api", "repairs"]: out = self.service.report_repair(actor, role, int(body.get("recall_id", 0)), body.get("vin", ""), int(body.get("dealer_id", 0)), int(body.get("remedy_version", 0)), body.get("evidence_hash", ""), bool(body.get("evidence_consistent", True)), body.get("border_permit", ""), body.get("idempotency_key", ""))
             elif len(p) == 4 and p[:2] == ["api", "repairs"] and p[3] == "review": out = self.service.review_repair(actor, role, int(p[2]), body.get("decision", ""), body.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "repairs"] and p[3] == "withdraw": out = self.service.withdraw_repair(actor, role, int(p[2]), body.get("note", ""))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
-        except ApiError as exc: self._send(exc.status, {"error": exc.message})
+        except ApiError as exc: self._send_error(exc)
         except (ValueError, TypeError, sqlite3.IntegrityError) as exc: self._send(400, {"error": str(exc)})
         except Exception as exc: self._send(500, {"error": str(exc)})
 

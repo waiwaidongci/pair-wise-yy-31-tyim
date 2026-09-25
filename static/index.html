@@ -1,1 +1,84 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>车辆召回跟踪</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>车辆安全召回与修复跟踪</h1><p>召回范围按版本发布，维修记录需结合车辆流转、零件库存、跨境许可和监管复核。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>车辆召回与跨境许可凭证</title>
+<style>
+body{font:15px system-ui;max-width:1180px;margin:28px auto;padding:0 20px;color:#1f2933}
+h1{font-size:22px} h2{font-size:16px;margin:22px 0 8px}
+.cards{display:flex;gap:16px;flex-wrap:wrap}
+.card{flex:1;min-width:300px;border:1px solid #d7dde3;border-radius:8px;padding:14px;background:#fbfcfd}
+label{display:block;margin:6px 0 2px;font-size:13px;color:#52606d}
+input,select{width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #cbd2d9;border-radius:4px;font:inherit}
+button{padding:7px 14px;margin-top:10px;border:0;border-radius:4px;background:#2563eb;color:#fff;cursor:pointer}
+button.ghost{background:#e4e7eb;color:#1f2933}
+.row{display:flex;gap:8px}.row>div{flex:1}
+pre{background:#0f172a;color:#e2e8f0;padding:14px;border-radius:8px;overflow:auto;min-height:60px;font-size:12.5px}
+.hint{color:#64748b;font-size:13px}
+</style>
+<h1>车辆安全召回与跨境许可凭证</h1>
+<p class="hint">监管按召回、车型和方案签发额度凭证；网点报修占用一笔，并发只放行一笔。复核通过核销，退回或撤回释放，使用记录保留。身份用请求头模拟：<code>X-Actor</code> / <code>X-Role</code>。</p>
+<div class="row" style="align-items:end;max-width:520px">
+  <div><label>身份角色</label><select id="role"><option value="regulator">regulator 监管</option><option value="dealer">dealer 网点</option><option value="manufacturer">manufacturer 厂商</option></select></div>
+  <div><label>身份标识</label><input id="actor" value="regulator-demo"></div>
+</div>
+
+<div class="cards">
+  <div class="card">
+    <h2>① 登记许可（监管签发）</h2>
+    <label>许可编号</label><input id="p_code" placeholder="P-2026-001">
+    <div class="row"><div><label>召回 ID</label><input id="p_recall" placeholder="1"></div>
+      <div><label>车型</label><input id="p_model" placeholder="X1"></div></div>
+    <div class="row"><div><label>国家（网点所在国）</label><input id="p_country" placeholder="SG"></div>
+      <div><label>额度</label><input id="p_quota" type="number" placeholder="5"></div></div>
+    <div class="row"><div><label>方案版本（可空=当前）</label><input id="p_ver" placeholder="1"></div>
+      <div><label>有效天数</label><input id="p_days" type="number" placeholder="180"></div></div>
+    <label>过期时间（与天数二选一，ISO8601）</label><input id="p_exp" placeholder="2026-12-31T23:59:59Z">
+    <button onclick="issue()">登记许可</button>
+  </div>
+
+  <div class="card">
+    <h2>② 占用额度（网点报修前/单测）</h2>
+    <label>许可编号</label><input id="h_code" placeholder="P-2026-001">
+    <div class="row"><div><label>召回 ID</label><input id="h_recall" placeholder="1"></div>
+      <div><label>网点 ID</label><input id="h_dealer" placeholder="2"></div></div>
+    <div class="row"><div><label>VIN</label><input id="h_vin" placeholder="LX00001"></div>
+      <div><label>数量</label><input id="h_amount" type="number" value="1"></div></div>
+    <label>请求键（同一键并发只放行一笔）</label><input id="h_key" placeholder="req-001">
+    <button onclick="hold()">占用</button>
+  </div>
+
+  <div class="card">
+    <h2>③ 释放占用</h2>
+    <label>占用流水 ID</label><input id="r_id" placeholder="3">
+    <label>原因</label><input id="r_reason" value="manual">
+    <button onclick="release()">释放</button>
+    <h2>④ 查余额 / 明细</h2>
+    <label>许可编号</label><input id="b_code" placeholder="P-DEMO-001">
+    <button onclick="balance()">查余额</button>
+    <button class="ghost" onclick="detail()">查明细（含占用流水）</button>
+  </div>
+</div>
+
+<h2>结果 <button class="ghost" onclick="loadState()">刷新全局状态</button></h2>
+<pre id="out">就绪。</pre>
+
+<script>
+const $=id=>document.getElementById(id);
+async function call(method,path,body){
+  const opt={method,headers:{'Content-Type':'application/json','X-Actor':$('actor').value||'x','X-Role':$('role').value}};
+  if(body)opt.body=JSON.stringify(body);
+  const r=await fetch(path,opt); $('out').textContent=`HTTP ${r.status}\n`+JSON.stringify(await r.json(),null,2);
+}
+function num(v){const n=parseInt(v,10);return Number.isNaN(n)?undefined:n}
+function issue(){call('POST','/api/permits',{code:$('p_code').value,recall_id:num($('p_recall').value),model:$('p_model').value,
+  country:$('p_country').value,quota:num($('p_quota').value),remedy_version:num($('p_ver').value),
+  valid_days:num($('p_days').value),expires_at:$('p_exp').value});}
+function hold(){call('POST',`/api/permits/${encodeURIComponent($('h_code').value)}/occupy`,
+  {recall_id:num($('h_recall').value),dealer_id:num($('h_dealer').value),vin:$('h_vin').value,
+   request_key:$('h_key').value,amount:num($('h_amount').value)||1});}
+function release(){call('POST',`/api/occupations/${num($('r_id').value)}/release`,{reason:$('r_reason').value});}
+function balance(){call('GET',`/api/permits/${encodeURIComponent($('b_code').value)}/balance`);}
+function detail(){call('GET',`/api/permits/${encodeURIComponent($('b_code').value)}`);}
+async function loadState(){$('out').textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}
+</script>
+</html>
