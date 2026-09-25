@@ -1,1 +1,126 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>车辆召回跟踪</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>车辆安全召回与修复跟踪</h1><p>召回范围按版本发布，维修记录需结合车辆流转、零件库存、跨境许可和监管复核。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>车辆召回与跨境许可</title>
+<style>
+body{font:15px system-ui;max-width:1180px;margin:28px auto;padding:0 20px;color:#1f2937}
+h1{margin-bottom:4px}.sub{color:#6b7280;margin-top:0}
+.bar{position:sticky;top:0;background:#fff;padding:10px 0;border-bottom:1px solid #e5e7eb;z-index:2;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+input,select,button{padding:7px 10px;border:1px solid #d1d5db;border-radius:6px;font:inherit}
+button{background:#2563eb;color:#fff;cursor:pointer}button:hover{background:#1d4ed8}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px}
+.card{border:1px solid #e5e7eb;border-radius:10px;padding:14px;background:#fff}
+.card h3{margin:0 0 10px;font-size:15px}
+label{display:block;font-size:12px;color:#6b7280;margin:8px 0 2px}
+input,select{width:100%;box-sizing:border-box}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+pre{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:8px;overflow:auto;max-height:380px;font-size:12px}
+table{border-collapse:collapse;width:100%;font-size:13px}td,th{border:1px solid #e5e7eb;padding:5px 8px;text-align:left}
+.tag{display:inline-block;padding:1px 7px;border-radius:10px;font-size:12px}.held{background:#fef3c7}.written_off{background:#dcfce7}.released{background:#f3f4f6}.active{background:#dbeafe}.revoked{background:#fee2e2}
+#msg{font-size:13px}
+</style></head><body>
+<h1>车辆安全召回与跨境维修许可</h1>
+<p class="sub">监管按召回 / 车型 / 方案版本签发额度，网点报修占用凭证：同一许可并发只放行一笔；过期、国家不符、方案换版、余量不足即拒绝并返回余量。复核核销，退回或撤回释放，记录保留。</p>
+
+<div class="bar">
+  <label style="margin:0">身份 <select id="role" style="width:auto"><option value="regulator">regulator 监管</option><option value="dealer">dealer 网点</option><option value="manufacturer">manufacturer 厂商</option></select></label>
+  <input id="actor" value="reg" style="width:130px" title="X-Actor">
+  <button onclick="loadState()">刷新状态</button>
+  <span id="msg"></span>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h3>① 监管登记许可（签发额度）</h3>
+    <div class="row"><div><label>许可编号</label><input id="p_code" value="BP-100"></div>
+      <div><label>召回 ID</label><input id="p_recall" value="1"></div></div>
+    <div class="row"><div><label>车型</label><input id="p_model" value="X"></div>
+      <div><label>方案版本</label><input id="p_remedy" type="number" value="1"></div></div>
+    <div class="row"><div><label>适用国家（网点国）</label><input id="p_country" value="SG"></div>
+      <div><label>额度</label><input id="p_total" type="number" value="3"></div></div>
+    <label>有效期至</label><input id="p_expires" type="datetime-local">
+    <label>备注</label><input id="p_note" value="跨境维修额度">
+    <p style="margin-top:10px"><button onclick="issuePermit()">签发许可</button>
+       <button style="background:#dc2626" onclick="revokePermit()">撤回（按编号）</button></p>
+  </div>
+
+  <div class="card">
+    <h3>② 网点占用一笔凭证</h3>
+    <div class="row"><div><label>许可编号</label><input id="o_code" value="BP-100"></div>
+      <div><label>引用键（如报修幂等键）</label><input id="o_ref" value="claim-1"></div></div>
+    <div class="row"><div><label>VIN</label><input id="o_vin" value="LX00001"></div>
+      <div><label>网点 ID</label><input id="o_dealer" type="number" value="2"></div></div>
+    <p><button onclick="occupy()">占用</button></p>
+    <h3 style="margin-top:14px">③ 释放凭证（退回 / 撤回）</h3>
+    <div class="row"><div><label>占用凭证 ID（usage id）</label><input id="r_id" type="number"></div>
+      <div><label>原因</label><select id="r_reason"><option value="return">return 复核退回</option><option value="withdraw">withdraw 网点撤回</option></select></div></div>
+    <label>备注</label><input id="r_note">
+    <p><button style="background:#d97706" onclick="releaseUsage()">释放</button></p>
+  </div>
+
+  <div class="card">
+    <h3>④ 查余额与凭证流水</h3>
+    <div class="row"><div><label>许可编号</label><input id="b_code" value="BP-100"></div>
+      <div style="display:flex;align-items:flex-end"><button onclick="balance()">查询余额</button></div></div>
+    <pre id="balance">点「查询余额」查看。</pre>
+  </div>
+
+  <div class="card">
+    <h3>许可清单与占用流水（最近）</h3>
+    <div id="lists">加载中...</div>
+  </div>
+</div>
+
+<h3>原始状态（/api/state）</h3><pre id="state">加载中...</pre>
+
+<script>
+const $=id=>document.getElementById(id);
+function headers(){return {'Content-Type':'application/json','X-Actor':$('actor').value||'reg','X-Role':$('role').value}}
+function setMsg(t,ok){$('msg').textContent=t;$('msg').style.color=ok?'#16a34a':'#dc2626'}
+async function api(path,method='GET',body){
+  const r=await fetch(path,{method,headers:headers(),body:body?JSON.stringify(body):undefined});
+  const data=await r.json();
+  if(!r.ok)throw Object.assign(new Error(data.error||('HTTP '+r)),{data});
+  return data;
+}
+async function run(fn){try{await fn()}catch(e){setMsg('✗ '+e.message,false);console.log(e.data)}}
+
+// 默认有效期 30 天后
+(function(){const d=new Date(Date.now()+30*864e5);d.setSeconds(0,0);$('p_expires').value=new Date(d.getTime()-d.getTimezoneOffset()*6e4).toISOString().slice(0,16)})();
+
+function issuePermit(){run(async()=>{
+  await api('/api/permits','POST',{permit_code:$('p_code').value,recall_id:+$('p_recall').value,model:$('p_model').value,
+    remedy_version:+$('p_remedy').value,country:$('p_country').value,total:+$('p_total').value,
+    expires_at:new Date($('p_expires').value).toISOString(),note:$('p_note').value});
+  setMsg('✓ 许可已签发',true);loadState();
+})}
+function revokePermit(){run(async()=>{
+  await api('/api/permits/'+encodeURIComponent($('p_code').value)+'/revoke','POST',{note:'页面撤回'});
+  setMsg('✓ 许可已撤回，占用全部释放',true);loadState();
+})}
+function occupy(){run(async()=>{
+  const u=await api('/api/permits/'+encodeURIComponent($('o_code').value)+'/occupy','POST',
+    {ref_key:$('o_ref').value,vin:$('o_vin').value,dealer_id:+$('o_dealer').value});
+  $('r_id').value=u.id;setMsg('✓ 占用成功，凭证 #'+u.id,true);loadState();
+})}
+function releaseUsage(){run(async()=>{
+  await api('/api/permit-usages/'+$('r_id').value+'/release','POST',{reason:$('r_reason').value,note:$('r_note').value});
+  setMsg('✓ 已释放，余量回补',true);loadState();balance();
+})}
+async function balance(){try{
+  const b=await api('/api/permits/'+encodeURIComponent($('b_code').value));
+  $('balance').textContent=JSON.stringify(b,null,2);
+}catch(e){$('balance').textContent='✗ '+e.message}}
+
+async function loadState(){
+  const s=await (await fetch('/api/state')).json();$('state').textContent=JSON.stringify(s,null,2);
+  const permits=(s.permits||[]).map(p=>`<tr><td>${p.permit_code}</td><td>召回${p.recall_id}</td><td>${p.model}</td>
+    <td>v${p.remedy_version}</td><td>${p.country}</td><td><b>${p.remaining}</b>/${p.total}</td>
+    <td>占${p.occupied} 销${p.written_off}</td><td><span class="tag ${p.status}">${p.status}</span>${p.expired?' <span class="tag revoked">expired</span>':''}</td>
+    <td>${p.expires_at}</td></tr>`).join('');
+  const usages=(s.permit_usages||[]).map(u=>`<tr><td>#${u.id}</td><td>许可${u.permit_id}</td><td>${u.ref_key}</td>
+    <td><span class="tag ${u.status}">${u.status}</span></td><td>${u.release_reason||''}</td><td>V${u.vehicle_id}/D${u.dealer_id}</td>
+    <td>维修${u.repair_id||'—'}</td><td>${u.occupied_at}</td></tr>`).join('');
+  $('lists').innerHTML=`<table><tr><th>许可</th><th></th><th>车型</th><th>方案</th><th>国家</th><th>余/总</th><th>占用/核销</th><th>状态</th><th>到期</th></tr>${permits}</table>
+    <h3 style="margin:12px 0 6px;font-size:13px">凭证流水（最近 50，记录始终保留）</h3>
+    <table><tr><th>#</th><th>许可</th><th>引用键</th><th>状态</th><th>释放原因</th><th>车/网点</th><th>维修</th><th>占用时间</th></tr>${usages}</table>`;
+}
+loadState();
+</script></body></html>

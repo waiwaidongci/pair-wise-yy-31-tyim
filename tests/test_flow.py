@@ -1,7 +1,9 @@
 import sys, tempfile, unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import ApiError, RecallService, Store
+from permit_service import PermitService
 
 
 class RecallFlowTest(unittest.TestCase):
@@ -23,10 +25,20 @@ class RecallFlowTest(unittest.TestCase):
         self.s.register_vehicle("maker", "manufacturer", "LX00002", "X", 2018, "CN", "李四")
         self.s.transfer_vehicle("dealer", "dealer", vehicle["vin"], "SG", "Wang")
         self.s.add_parts("maker", "manufacturer", recall["id"], self.dealer_sg["id"], 1, 2)
+        expires = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+        permit = PermitService(self.s.store).issue("reg", "regulator", "BP-9", recall["id"], "X", 1, "SG", 5, expires, "跨境维修额度")
+        self.assertEqual(5, permit["remaining"])
         report = self.s.report_repair("dealer", "dealer", recall["id"], vehicle["vin"], self.dealer_sg["id"], 1, "abc123", True, "BP-9", "repair-1")
         self.assertEqual("reported", report["status"])
+        balance = PermitService(self.s.store).balance("reg", "regulator", "BP-9")
+        self.assertEqual(4, balance["permit"]["remaining"])
+        self.assertEqual(1, balance["held_count"])
         confirmed = self.s.review_repair("reg", "regulator", report["id"], "confirm", "证据一致")
         self.assertEqual("confirmed", confirmed["status"])
+        balance = PermitService(self.s.store).balance("reg", "regulator", "BP-9")
+        self.assertEqual(4, balance["permit"]["remaining"])
+        self.assertEqual(1, balance["written_off_count"])
+        self.assertEqual(0, balance["held_count"])
         before = self.s.unfinished("reg", "regulator", recall["id"])
         self.assertEqual(1, before["unfinished_count"])
         changed = self.s.change_scope("maker", "manufacturer", recall["id"], {"models": ["X"], "model_years": [2018], "vin_prefixes": ["LX"], "countries": ["CN"]}, recall["revision"])
